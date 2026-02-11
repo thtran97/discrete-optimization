@@ -148,7 +148,7 @@ def rebuild_multiskill_solution(
 ) -> Union[MultiskillRcpspSolution, PreemptiveMultiskillRcpspSolution]:
     """
     This function takes the schedule from the RCPSP solution and rebuilds the solution for the multiskill problem.
-    NOTE: need review, this function is currently not used.
+    NOTE: this function is not used in the current code
     """
     new_horizon = multimode_rcpsp_problem.horizon
     resource_avail_in_time = {}
@@ -287,8 +287,9 @@ def rebuild_multiskill_solution_cp_based(
     time_limit: int = 3600,
 ) -> ResultStorage:
     """
-    Reconstructs a valid multi-skill RCPSP solution from the schedule from an RCPSP solution
-    by assigning specific employees to tasks.
+    This function rebuilds the solution for the multiskill problem by adding constraints to a CP model. 
+    The constraint ensures that the same workers are used for the same tasks as in the RCPSP solution. 
+    The CP model was then solved using the Chuffed solver.
 
     Args:
         multiskill_rcpsp_problem: The multi-skill RCPSP problem
