@@ -148,7 +148,7 @@ def rebuild_multiskill_solution(
 ) -> Union[MultiskillRcpspSolution, PreemptiveMultiskillRcpspSolution]:
     """
     This function takes the schedule from the RCPSP solution and rebuilds the solution for the multiskill problem.
-    NOTE: this function is not used in the current code
+    NOTE: need review, this function is currently not used.
     """
     new_horizon = multimode_rcpsp_problem.horizon
     resource_avail_in_time = {}
@@ -277,12 +277,8 @@ def rebuild_multiskill_solution(
 
 def rebuild_multiskill_solution_cp_based(
     multiskill_rcpsp_problem: MultiskillRcpspProblem,
-    multimode_rcpsp_problem: Union[
-        RcpspProblem, PreemptiveRcpspProblem
-    ],  # TODO: need review, currently unused
-    worker_type_to_worker: dict[
-        str, set[Union[str, int]]
-    ],  # TODO: need review, currently unused
+    multimode_rcpsp_problem: Union[RcpspProblem, PreemptiveRcpspProblem],   # TODO: need review, currently unused
+    worker_type_to_worker: dict[str, set[Union[str, int]]],                 # TODO: need review, currently unused
     solution_rcpsp: Union[RcpspSolution, PreemptiveRcpspSolution],
     time_limit: int = 3600,
 ) -> ResultStorage:
