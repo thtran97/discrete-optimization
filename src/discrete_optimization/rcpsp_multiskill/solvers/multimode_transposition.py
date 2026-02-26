@@ -25,10 +25,12 @@ from discrete_optimization.rcpsp_multiskill.problem import (
     MultiskillRcpspSolution,
     PreemptiveMultiskillRcpspSolution,
 )
+from discrete_optimization.generic_tools.cp_tools import SignEnum
 from discrete_optimization.rcpsp_multiskill.solvers.cp_mzn import (
     CpMultiskillRcpspSolver,
     CpPreemptiveMultiskillRcpspSolver,
     CpSolverName,
+    soft_start_times,
     stick_to_solution,
     stick_to_solution_preemptive,
 )
@@ -50,6 +52,8 @@ class MultimodeTranspositionMultiskillRcpspSolver(SolverDO):
         max_number_of_mode: int = 3,
         check_resource_compliance: bool = True,
         reconstruction_cp_time_limit: int = 3600,
+        reconstruction_strategy: str = "hard",
+        bounded_slack_delta: int = 10,
         **kwargs,
     ):
         """Initialize the multimode transposition solver.
@@ -64,6 +68,11 @@ class MultimodeTranspositionMultiskillRcpspSolver(SolverDO):
             max_number_of_mode: Maximum number of modes per task during transformation
             check_resource_compliance: Whether to check resource compliance during transformation
             reconstruction_cp_time_limit: Time limit (seconds) for CP-based reconstruction
+            reconstruction_strategy: Strategy for reconstruction constraints.
+                - 'hard': Hard equality constraints on start times (default, original behavior)
+                - 'soft_penalty': Soft penalty for deviating from start times
+                - 'bounded_slack': Bounded constraints allowing deviation within delta
+            bounded_slack_delta: Maximum deviation allowed for 'bounded_slack' strategy (default: 10)
             **kwargs: Additional arguments for parent class
         """
         super().__init__(
@@ -76,6 +85,19 @@ class MultimodeTranspositionMultiskillRcpspSolver(SolverDO):
         self.max_number_of_mode = max_number_of_mode
         self.check_resource_compliance = check_resource_compliance
         self.reconstruction_cp_time_limit = reconstruction_cp_time_limit
+        
+        # Validate reconstruction strategy
+        valid_strategies = ["hard", "soft_penalty", "bounded_slack"]
+        if reconstruction_strategy not in valid_strategies:
+            raise ValueError(
+                f"reconstruction_strategy must be one of {valid_strategies}, "
+                f"got: {reconstruction_strategy}"
+            )
+        self.reconstruction_strategy = reconstruction_strategy
+        self.bounded_slack_delta = bounded_slack_delta
+
+        # Store the multimode solution for potential reuse in reconstruction (optional)
+        self.multimode_solution = None
 
     def solve(self, **kwargs) -> ResultStorage:
         """Solve the multi-skill RCPSP using two-stage decomposition.
@@ -115,6 +137,7 @@ class MultimodeTranspositionMultiskillRcpspSolver(SolverDO):
         logger.info("Solving the multi-mode RCPSP problem...")
         result_store = self.solver_multimode_rcpsp.solve(**kwargs)
         solution, fit = result_store.get_best_solution_fit()
+        self.multimode_solution = solution
 
         # Check if a solution was found
         if solution is None:
@@ -129,15 +152,41 @@ class MultimodeTranspositionMultiskillRcpspSolver(SolverDO):
         logger.info(f"Multi-mode RCPSP solution obtained with objective/fit: {fit}")
 
         # Rebuild the solution for the multiskill problem using the solution of the rcpsp problem
-        logger.info("Rebuild solution for the multiskill problem")
+        logger.info(f"Rebuild solution for the multiskill problem using '{self.reconstruction_strategy}' strategy")
         res = rebuild_multiskill_solution_cp_based(
             multiskill_rcpsp_problem=self.problem,
             multimode_rcpsp_problem=self.multimode_problem,
             worker_type_to_worker=self.worker_type_to_worker,
             solution_rcpsp=solution,
             time_limit=self.reconstruction_cp_time_limit,
+            reconstruction_strategy=self.reconstruction_strategy,
+            bounded_slack_delta=self.bounded_slack_delta,
         )
         return res
+    
+    def try_rebuild_solution(self, 
+                             reconstruction_strategy: str = "hard", 
+                             bounded_slack_delta: int = 10
+                             ) -> ResultStorage:
+        """Try to rebuild a solution for the multiskill problem using the multimode solution."""
+        if self.multimode_solution is None:
+            logger.warning("No multimode solution available to rebuild from. Running solve() first to obtain a solution of the multimode problem.")
+            return None
+        
+        try:
+            rebuilt_solution = rebuild_multiskill_solution_cp_based(
+                multiskill_rcpsp_problem=self.problem,
+                multimode_rcpsp_problem=self.multimode_problem,
+                worker_type_to_worker=self.worker_type_to_worker,
+                solution_rcpsp=self.multimode_solution,
+                time_limit=self.reconstruction_cp_time_limit,
+                reconstruction_strategy=reconstruction_strategy,
+                bounded_slack_delta=bounded_slack_delta,
+            )
+            return rebuilt_solution
+        except Exception as e:
+            logger.error(f"Error during solution rebuilding: {e}")
+            return None
 
 
 def rebuild_multiskill_solution(
@@ -281,6 +330,8 @@ def rebuild_multiskill_solution_cp_based(
     worker_type_to_worker: dict[str, set[Union[str, int]]],                 # TODO: need review, currently unused
     solution_rcpsp: Union[RcpspSolution, PreemptiveRcpspSolution],
     time_limit: int = 3600,
+    reconstruction_strategy: str = "hard",
+    bounded_slack_delta: int = 10,
 ) -> ResultStorage:
     """
     This function rebuilds the solution for the multiskill problem by adding constraints to a CP model. 
@@ -293,7 +344,12 @@ def rebuild_multiskill_solution_cp_based(
         worker_type_to_worker: Mapping from worker types to employee sets
         solution_rcpsp: The RCPSP solution to constrain to
         time_limit: Time limit in seconds for CP solver
-
+        reconstruction_strategy: Strategy for reconstruction constraints.
+            - 'hard': Hard equality constraints on start times (default)
+            - 'soft_penalty': Soft penalty for deviating from start times
+            - 'bounded_slack': Bounded constraints allowing deviation within delta
+        bounded_slack_delta: Maximum deviation allowed for 'bounded_slack' strategy
+        
     Returns:
         ResultStorage: containing the reconstructed multi-skill RCPSP solutions
     """
@@ -308,10 +364,44 @@ def rebuild_multiskill_solution_cp_based(
             exact_skills_need=False,
             output_type=True,
         )
-        # Constraint to stick to the solution of the RCPSP problem
-        strings = stick_to_solution(solution_rcpsp, model)
-        for s in strings:
-            model.instance.add_string(s)
+        
+        # Apply reconstruction strategy
+        if reconstruction_strategy == "hard":
+            # Hard equality constraints (original behavior)
+            strings = stick_to_solution(solution_rcpsp, model)
+            for s in strings:
+                model.instance.add_string(s)
+        elif reconstruction_strategy == "soft_penalty":
+            # Soft penalty for deviating from start times
+            dict_start_times = {
+                task: solution_rcpsp.rcpsp_schedule[task]["start_time"]
+                for task in solution_rcpsp.rcpsp_schedule
+            }
+            strings, penalty_vars = soft_start_times(dict_start_times, model)
+            for s in strings:
+                model.instance.add_string(s)
+            # Link penalty to sec_objective in the MiniZinc model
+            # The penalty_vars list contains names of penalty variables defined in strings above
+            if penalty_vars:
+                penalty_sum = "+".join(penalty_vars)
+                sec_objective_constraint = f"constraint sec_objective=={penalty_sum};\n"
+                model.instance.add_string(sec_objective_constraint)
+        elif reconstruction_strategy == "bounded_slack":
+            # Bounded constraints allowing deviation within delta
+            for task in solution_rcpsp.rcpsp_schedule:
+                start_time = solution_rcpsp.rcpsp_schedule[task]["start_time"]
+                # Lower bound: start_time - delta <= s[task]
+                lower_bound_str = model.constraint_start_time_string(
+                    task, max(0, start_time - bounded_slack_delta), sign=SignEnum.UEQ
+                )
+                model.instance.add_string(lower_bound_str)
+                # Upper bound: s[task] <= start_time + delta
+                upper_bound_str = model.constraint_start_time_string(
+                    task, start_time + bounded_slack_delta, sign=SignEnum.LEQ
+                )
+                model.instance.add_string(upper_bound_str)
+        else:
+            raise ValueError(f"Unknown reconstruction_strategy: {reconstruction_strategy}")
     else:
         model = CpPreemptiveMultiskillRcpspSolver(
             problem=multiskill_rcpsp_problem, cp_solver_name=CpSolverName.CHUFFED
@@ -326,7 +416,14 @@ def rebuild_multiskill_solution_cp_based(
             unit_usage_preemptive=True,
             max_preempted=100,
         )
-        # Constraint to stick to the solution of the RCPSP problem
+        
+        # For preemptive case, currently only hard constraints are supported
+        # TODO: Extend soft_penalty and bounded_slack to preemptive scheduling
+        if reconstruction_strategy != "hard":
+            logger.warning(
+                f"Reconstruction strategy '{reconstruction_strategy}' not yet implemented "
+                f"for preemptive scheduling. Falling back to 'hard' strategy."
+            )
         strings = stick_to_solution_preemptive(solution_rcpsp, model)
         for s in strings:
             model.instance.add_string(s)
