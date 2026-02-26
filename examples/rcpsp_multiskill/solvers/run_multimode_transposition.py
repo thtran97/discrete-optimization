@@ -127,11 +127,33 @@ def run_multimode_transposition_on_toy_problem():
     if best_solution is None:
         print("No solution found within the time limit.")
     else:
-        print("SOLUTION FOUND")
+        print("SOLUTION FOUND with hard reconstruction strategy")
         print(f"Objective/Fitness: {fit}")
         print(f"Makespan: {best_solution.get_end_time(model.sink_task)}")
         print(f"Feasible: {model.satisfy(best_solution)}")
 
+    # try with another reconstruction strategy
+    print(f"\nTrying with a different reconstruction strategy: soft_penalty...")
+    result_store_soft = solver.try_rebuild_solution(reconstruction_strategy="soft_penalty")
+    best_solution_soft, fit_soft = result_store_soft.get_best_solution_fit()
+    if best_solution_soft is None:
+        print("No solution found within the time limit (for soft_penalty reconstruction strategy).")
+    else:
+        print("SOLUTION FOUND with soft_penalty reconstruction strategy")
+        print(f"Objective/Fitness: {fit_soft}")
+        print(f"Makespan: {best_solution_soft.get_end_time(model.sink_task)}")
+        print(f"Feasible: {model.satisfy(best_solution_soft)}")
+
+    print(f"\nTrying with another reconstruction strategy: bounded_slack...")
+    result_store_bounded = solver.try_rebuild_solution(reconstruction_strategy="bounded_slack")
+    best_solution_bounded, fit_bounded = result_store_bounded.get_best_solution_fit()
+    if best_solution_bounded is None:
+        print("No solution found within the time limit (for bounded_slack reconstruction strategy).")
+    else:
+        print("SOLUTION FOUND with bounded_slack reconstruction strategy")
+        print(f"Objective/Fitness: {fit_bounded}")
+        print(f"Makespan: {best_solution_bounded.get_end_time(model.sink_task)}")
+        print(f"Feasible: {model.satisfy(best_solution_bounded)}")
 
 def run_multimode_transposition_on_imopse():
     """
@@ -183,6 +205,7 @@ def run_multimode_transposition_on_imopse():
     solver = MultimodeTranspositionMultiskillRcpspSolver(
         problem=imopse_problem,
         reconstruction_cp_time_limit=RECONSTRUCTION_TIME_LIMIT,
+        reconstruction_strategy="hard" # i.e. enforces the start times for each task as found in the multimode solution
     )
 
     # Configure solver parameters
@@ -193,22 +216,43 @@ def run_multimode_transposition_on_imopse():
     print(f"\nSolving with multimode transposition approach...")
     print(f"  - Multimode solver time limit: {MULTIMODE_SOLVER_TIME_LIMIT} seconds")
     print(f"  - Reconstruction CP time limit: {RECONSTRUCTION_TIME_LIMIT} seconds")
-    result_store = solver.solve(
-        parameters_cp=parameters_cp, time_limit=MULTIMODE_SOLVER_TIME_LIMIT
-    )
-
+    result_store_hard = solver.solve(parameters_cp=parameters_cp, time_limit=MULTIMODE_SOLVER_TIME_LIMIT)
     # Retrieve the best solution
-    best_solution, fit = result_store.get_best_solution_fit()
+    solution_hard, fit_hard = result_store_hard.get_best_solution_fit()
+    if solution_hard is None:
+        print("\nNo solution found within the time limit (for hard reconstruction strategy).")
 
-    if best_solution is None:
-        print("\nNo solution found within the time limit.")
-    else:
-        print("SOLUTION FOUND")
-        print(f"Objective/Fitness: {fit}")
-        print(f"Makespan: {best_solution.get_end_time(imopse_problem.sink_task)}")
-        print(f"Feasible: {imopse_problem.satisfy(best_solution)}")
+    # Try with another reconstruction strategy
+    print(f"\nTrying with a different reconstruction strategy: soft_penalty...")
+    result_store_soft = solver.try_rebuild_solution(reconstruction_strategy="soft_penalty")
+    solution_soft, fit_soft = result_store_soft.get_best_solution_fit()
+    if solution_soft is None:
+        print("\nNo solution found within the time limit (for soft_penalty reconstruction strategy).")
 
+    print(f"\nTrying with another reconstruction strategy: bounded_slack...")
+    result_store_bounded = solver.try_rebuild_solution(reconstruction_strategy="bounded_slack")
+    solution_bounded, fit_bounded = result_store_bounded.get_best_solution_fit()
+    if solution_bounded is None:
+        print("\nNo solution found within the time limit (for bounded_slack reconstruction strategy).")
+
+
+    print("=== Summary === ")
+    print("Strategy\\t\tFitness\t\tMakespan\tFeasible")
+    print(f"Hard\t\t{fit_hard}\
+          \t{solution_hard.get_end_time(imopse_problem.sink_task) if solution_hard is not None else 'N/A'}\
+          \t{imopse_problem.satisfy(solution_hard) if solution_hard is not None else 'N/A'}")
+    print(f"Soft Penalty\t{fit_soft}\
+          \t{solution_soft.get_end_time(imopse_problem.sink_task) if solution_soft is not None else 'N/A'}\
+          \t{imopse_problem.satisfy(solution_soft) if solution_soft is not None else 'N/A'}")
+    print(f"Bounded Slack\t{fit_bounded}\
+          \t{solution_bounded.get_end_time(imopse_problem.sink_task) if solution_bounded is not None else 'N/A'}\
+          \t{imopse_problem.satisfy(solution_bounded) if solution_bounded is not None else 'N/A'}")
+    
+    # print(f"Objective/Fitness: {fit_hard}")
+    # print(f"Makespan: {solution_hard.get_end_time(imopse_problem.sink_task)}")
+    # print(f"Feasible: {imopse_problem.satisfy(solution_hard)}")
+    
 
 if __name__ == "__main__":
-    run_multimode_transposition_on_toy_problem()
+    # run_multimode_transposition_on_toy_problem()
     run_multimode_transposition_on_imopse()
