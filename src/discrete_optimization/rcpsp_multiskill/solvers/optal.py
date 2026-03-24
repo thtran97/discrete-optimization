@@ -299,6 +299,7 @@ class OptalMSRcpspSolver(
                 sum_skills_employee = self.cp_model.sum(
                     [
                         skills_used[task][worker][skill]
+                        * self.problem.employees[worker].get_skill_level(skill)
                         for worker in skills_used[task]
                         if skill in skills_used[task][worker]
                     ]
@@ -360,11 +361,11 @@ class OptalMSRcpspSolver(
         ]
         tasks = [
             (
-                self.variables["opt_interval"][task][mode],
+                self.variables["opt_interval_var"][task][mode],
                 self.problem.mode_details[task][mode].get(res, 0),
             )
-            for task in self.variables["opt_interval"]
-            for mode in self.variables["opt_interval"][task]
+            for task in self.variables["opt_interval_var"]
+            for mode in self.variables["opt_interval_var"][task]
             if self.problem.mode_details[task][mode].get(res, 0) > 0
         ]
         if capacity == 1:
@@ -580,64 +581,109 @@ class OptalMSRcpspSolver(
         else:
             return 0
 
-    def retrieve_solution(self, result: cp.SolveResult) -> MultiskillRcpspSolution:
-        logger.info(f"Current obj {result.solution.get_objective()}")
+    def retrieve_solution(
+        self, result: cp.SolveResult | cp.SolutionEvent
+    ) -> Optional[MultiskillRcpspSolution]:
+        
+        # Depending on the version of optalcp, the solution object might be directly the result or in result.solution
+        # As in preview versions, the solution object does not have get_start method
+        # We check the presence of this method to identify if we are in a preview version or not.
+        sol_obj = result
+        if not hasattr(result, "get_start") and hasattr(result, "solution"):
+            sol_obj = result.solution
+        if sol_obj is None:
+            return None
+        
+        # Get objective
+        try:
+            objective = sol_obj.get_objective()
+            logger.info(f"Current obj {objective}")
+        except Exception:
+            objective = None
+        
+            
         modes_dict = {}
         schedule = {}
         employee_usage = {}
+        
+        # Try to retrieve schedule (might not be possible in preview version)
+        any_val = False
         for task in self.variables["interval_var"]:
             itv = self.get_task_interval_variable(task)
+            start = sol_obj.get_start(itv)
+            end = sol_obj.get_end(itv)
+            if start is not None:
+                any_val = True
             schedule[task] = {
-                "start_time": result.solution.get_start(itv),
-                "end_time": result.solution.get_end(itv),
+                "start_time": start,
+                "end_time": end,
             }
+        
+        # If no values (we are in a preview version), but we have an objective, 
+        # we can at least set the sink task end time if we identify it.
+        if not any_val and objective is not None:
+            schedule[self.problem.sink_task] = {
+                "start_time": None,
+                "end_time": int(objective),
+            }
+
+        # Try to retrieve modes (might not be possible in preview version)
         for task in self.problem.tasks_list:
             modes = list(self.problem.mode_details[task].keys())
             if len(modes) == 1:
                 modes_dict[task] = modes[0]
-            else:
-                for mode in self.variables["opt_interval_var"][task]:
-                    if result.solution.is_present(
-                        self.variables["opt_interval_var"][task][mode]
-                    ):
-                        modes_dict[task] = mode
-                        break
+                continue # proceed to next task
+            
+            # get the mode that is present among the optional intervals
+            for mode in self.variables["opt_interval_var"][task]:
+                presence = sol_obj.is_present(self.variables["opt_interval_var"][task][mode])
+                if presence is True or presence == 1:
+                    modes_dict[task] = mode
+                    break
+            if task not in modes_dict:
+                modes_dict[task] = modes[0]  # Fallback
 
-        for task in self.problem.tasks_list:
-            skills_needed = set(
-                [
-                    s
-                    for s in self.problem.skills_set
-                    if self.problem.mode_details[task][modes_dict[task]].get(s, 0) > 0
-                ]
-            )
-            employee_usage[task] = {}
-            if task in self.variables["worker_variable"]["opt_intervals"]:
-                for worker in self.variables["worker_variable"]["opt_intervals"][task]:
-                    if result.solution.is_present(
-                        self.variables["worker_variable"]["opt_intervals"][task][worker]
-                    ):
-                        sk_nz = self.problem.employees[worker].get_non_zero_skills()
-                        if "skills_used" in self.variables["worker_variable"]:
-                            contrib = set()
-                            for s in self.variables["worker_variable"]["skills_used"][
-                                task
-                            ][worker]:
-                                if result.solution.get_value(
-                                    self.variables["worker_variable"]["skills_used"][
-                                        task
-                                    ][worker][s]
-                                ):
-                                    contrib.add(s)
-                        else:
-                            contrib = set(sk_nz).intersection(skills_needed)
-                        if len(contrib) > 0:
-                            employee_usage[task][worker] = contrib
+        # Try to retrieve employee usage (might not be possible in preview version)
+        if any_val:
+            for task in self.problem.tasks_list:
+                skills_needed = set(
+                    [
+                        s
+                        for s in self.problem.skills_set
+                        if self.problem.mode_details[task].get(modes_dict.get(task, 1), {}).get(s, 0) > 0
+                    ]
+                )
+                employee_usage[task] = {}
+                if task in self.variables["worker_variable"]["opt_intervals"]:
+                    for worker in self.variables["worker_variable"]["opt_intervals"][task]:
+                        presence = sol_obj.is_present(
+                            self.variables["worker_variable"]["opt_intervals"][task][worker]
+                        )
+                        if presence is True or presence == 1:
+                            sk_nz = self.problem.employees[worker].get_non_zero_skills()
+                            if "skills_used" in self.variables["worker_variable"]:
+                                contrib = set()
+                                for s in self.variables["worker_variable"]["skills_used"][
+                                    task
+                                ][worker]:
+                                    val = sol_obj.get_value(
+                                        self.variables["worker_variable"]["skills_used"][
+                                            task
+                                        ][worker][s]
+                                    )
+                                    if val is True or val == 1:
+                                        contrib.add(s)
+                            else:
+                                contrib = set(sk_nz).intersection(skills_needed)
+                            if len(contrib) > 0:
+                                employee_usage[task][worker] = contrib
+        
         sol = MultiskillRcpspSolution(
             problem=self.problem,
             schedule=schedule,
             modes=modes_dict,
             employee_usage=employee_usage,
         )
-        sol._internal_obj = {}
+        sol._internal_obj = {"makespan": objective}
+        sol._external_feasible = True # TODO: need to clarify: feasible or optimal?
         return sol
