@@ -417,16 +417,97 @@ def rebuild_multiskill_solution_cp_based(
             max_preempted=100,
         )
         
-        # For preemptive case, currently only hard constraints are supported
-        # TODO: Extend soft_penalty and bounded_slack to preemptive scheduling
-        if reconstruction_strategy != "hard":
-            logger.warning(
-                f"Reconstruction strategy '{reconstruction_strategy}' not yet implemented "
-                f"for preemptive scheduling. Falling back to 'hard' strategy."
-            )
-        strings = stick_to_solution_preemptive(solution_rcpsp, model)
-        for s in strings:
-            model.instance.add_string(s)
+        if reconstruction_strategy == "hard":
+            strings = stick_to_solution_preemptive(solution_rcpsp, model)
+            for s in strings:
+                model.instance.add_string(s)
+        elif reconstruction_strategy == "soft_penalty":
+            penalty_vars = []
+            for task in solution_rcpsp.rcpsp_schedule:
+                starts = solution_rcpsp.rcpsp_schedule[task]["starts"]
+                ends = solution_rcpsp.rcpsp_schedule[task]["ends"]
+                is_paused = len(starts) > 1
+                model.instance.add_string(model.constraint_is_paused(task=task, is_paused=is_paused))
+                
+                for i in range(len(starts)):
+                    model.instance.add_string(
+                        model.constraint_duration_string_preemptive_i(
+                            task, duration=ends[i] - starts[i], part_id=i + 1, sign=SignEnum.EQUAL
+                        )
+                    )
+                    task_idx = model.index_in_minizinc[task]
+                    part_idx = i + 1
+                    target_start = starts[i]
+                    penalty_var = f"penalty_start_{task_idx}_{part_idx}"
+                    
+                    model.instance.add_string(f"var 0..max_time: {penalty_var};\n")
+                    model.instance.add_string(
+                        f"constraint abs(s_preemptive[{task_idx},{part_idx}]-{target_start})=={penalty_var};\n"
+                    )
+                    penalty_vars.append(penalty_var)
+                    
+                for k in range(len(starts), model.nb_preemptive):
+                    model.instance.add_string(
+                        model.constraint_duration_string_preemptive_i(
+                            task, duration=0, part_id=k + 1, sign=SignEnum.EQUAL
+                        )
+                    )
+                    task_idx = model.index_in_minizinc[task]
+                    part_idx = k + 1
+                    target_start = ends[-1] if len(ends) > 0 else 0
+                    penalty_var = f"penalty_start_{task_idx}_{part_idx}"
+                    
+                    model.instance.add_string(f"var 0..max_time: {penalty_var};\n")
+                    model.instance.add_string(
+                        f"constraint abs(s_preemptive[{task_idx},{part_idx}]-{target_start})=={penalty_var};\n"
+                    )
+                    penalty_vars.append(penalty_var)
+                    
+            if penalty_vars:
+                penalty_sum = "+".join(penalty_vars)
+                sec_objective_constraint = f"constraint sec_objective=={penalty_sum};\n"
+                model.instance.add_string(sec_objective_constraint)
+        elif reconstruction_strategy == "bounded_slack":
+            for task in solution_rcpsp.rcpsp_schedule:
+                starts = solution_rcpsp.rcpsp_schedule[task]["starts"]
+                ends = solution_rcpsp.rcpsp_schedule[task]["ends"]
+                is_paused = len(starts) > 1
+                model.instance.add_string(model.constraint_is_paused(task=task, is_paused=is_paused))
+                
+                for i in range(len(starts)):
+                    model.instance.add_string(
+                        model.constraint_duration_string_preemptive_i(
+                            task, duration=ends[i] - starts[i], part_id=i + 1, sign=SignEnum.EQUAL
+                        )
+                    )
+                    lower_bound_str = model.constraint_start_time_string_preemptive_i(
+                        task, start_time=max(0, starts[i] - bounded_slack_delta), part_id=i + 1, sign=SignEnum.UEQ
+                    )
+                    model.instance.add_string(lower_bound_str)
+                    
+                    upper_bound_str = model.constraint_start_time_string_preemptive_i(
+                        task, start_time=starts[i] + bounded_slack_delta, part_id=i + 1, sign=SignEnum.LEQ
+                    )
+                    model.instance.add_string(upper_bound_str)
+                    
+                for k in range(len(starts), model.nb_preemptive):
+                    model.instance.add_string(
+                        model.constraint_duration_string_preemptive_i(
+                            task, duration=0, part_id=k + 1, sign=SignEnum.EQUAL
+                        )
+                    )
+                    target_start = ends[-1] if len(ends) > 0 else 0
+                    lower_bound_str = model.constraint_start_time_string_preemptive_i(
+                        task, start_time=max(0, target_start - bounded_slack_delta), part_id=k + 1, sign=SignEnum.UEQ
+                    )
+                    model.instance.add_string(lower_bound_str)
+                    
+                    upper_bound_str = model.constraint_start_time_string_preemptive_i(
+                        task, start_time=target_start + bounded_slack_delta, part_id=k + 1, sign=SignEnum.LEQ
+                    )
+                    model.instance.add_string(upper_bound_str)
+        else:
+            raise ValueError(f"Unknown reconstruction_strategy: {reconstruction_strategy}")
 
     # Solve the CP model
     result_store = model.solve(time_limit=time_limit)
