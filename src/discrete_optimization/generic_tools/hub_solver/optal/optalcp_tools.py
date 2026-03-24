@@ -88,8 +88,12 @@ class OptalCpSolver(CpSolver, BoundsProviderMixin):
         kw = {"timeLimit": time_limit, "nbWorkers": parameters_cp.nb_process}
         kw.update(args)
         result = self.cp_model.solve(parameters=cp.Parameters(**kw))
-        sol = self.retrieve_solution(result)
-        fit = self.aggreg_from_sol(sol)
+        if result.solution is not None:
+            sol = self.retrieve_solution(result)
+            fit = self.aggreg_from_sol(sol)
+        else:
+            sol = None
+            fit = self.aggreg_from_sol(None)
         if result.solution is not None:
             if result.proof:
                 self.status_solver = StatusSolver.OPTIMAL
@@ -240,8 +244,9 @@ class OptalSolutionCallback:
         self.do_solver.current_obj = solution.solution.get_objective()
         if not self.do_not_retrieve_solutions:
             sol = self.do_solver.retrieve_solution(solution)
-            fit = self.do_solver.aggreg_from_sol(sol)
-            self.res.append((sol, fit))
+            if sol is not None:
+                fit = self.do_solver.aggreg_from_sol(sol)
+                self.res.append((sol, fit))
         self.nb_solutions += 1
         try:
             stopping = self.callback.on_step_end(
