@@ -649,10 +649,18 @@ def build_evaluate_function_aggregated(
 
         def eval_sol(solution: Solution) -> float:
             dict_values = problem.evaluate(solution)
-            return sign * dict_values[objectives[0]] * weights[0]
+            val = dict_values[objectives[0]]
+            if val is None:
+                logger.error(f"Evaluation of {objectives[0]} returned None for solution {solution}")
+                return 10**10 # a very large number
+            return sign * val * weights[0]
 
         def eval_from_dict_values(dict_values: dict[str, float]) -> float:
-            return sign * dict_values[objectives[0]] * weights[0]
+            val = dict_values[objectives[0]]
+            if val is None:
+                logger.error(f"Evaluation of {objectives[0]} returned None from dict {dict_values}")
+                return 10**10 # a very large number
+            return sign * val * weights[0]
 
         return eval_sol, eval_from_dict_values
 

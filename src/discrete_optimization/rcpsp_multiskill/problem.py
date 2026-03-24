@@ -2401,6 +2401,10 @@ class MultiskillRcpspProblem(
         if len(rcpsp_sol.schedule) != self.nb_tasks:
             return False
         for task in self.tasks_list:
+            if task not in rcpsp_sol.schedule:
+                return False
+            if rcpsp_sol.schedule[task].get("start_time") is None or rcpsp_sol.schedule[task].get("end_time") is None:
+                return False
             mode = rcpsp_sol.modes[task]
             required_skills = {
                 s: self.mode_details[task][mode][s]
@@ -2409,6 +2413,8 @@ class MultiskillRcpspProblem(
             }
             # Skills for the given task are used
             if len(required_skills) > 0:
+                if task not in rcpsp_sol.employee_usage:
+                    return False
                 for skill in required_skills:
                     employees_used = [
                         self.employees[emp].dict_skill[skill].skill_value
