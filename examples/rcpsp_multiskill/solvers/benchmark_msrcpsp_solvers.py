@@ -4,9 +4,8 @@ import logging
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from typing import Dict, Any, List
+from typing import Callable, Dict, Any, List, Tuple
 from discrete_optimization.rcpsp_multiskill.problem import MultiskillRcpspProblem, VariantMultiskillRcpspProblem
-from discrete_optimization.rcpsp_multiskill.parser_imopse import get_data_available, parse_file
 from discrete_optimization.rcpsp_multiskill.solvers.multimode_transposition import MultimodeTranspositionMultiskillRcpspSolver
 from discrete_optimization.rcpsp_multiskill.solvers.cp_mzn import CpMultiskillRcpspSolver, CpSolverName
 from discrete_optimization.rcpsp_multiskill.solvers.cpsat import CpSatMultiskillRcpspSolver
@@ -253,54 +252,135 @@ class BenchmarkRunner:
 
 import argparse
 
+
+def _collect_instances(
+    datasets: List[str],
+) -> List[Tuple[str, str, Callable[[str], MultiskillRcpspProblem]]]:
+    """Return a flat list of (dataset_tag, file_path, parse_fn) for all requested datasets.
+
+    parse_fn always returns a single MultiskillRcpspProblem.
+    """
+    instances: List[Tuple[str, str, Callable[[str], MultiskillRcpspProblem]]] = []
+
+    if "imopse" in datasets:
+        try:
+            from discrete_optimization.rcpsp_multiskill.parser_imopse import (
+                get_data_available as imopse_avail,
+                parse_file as imopse_parse,
+            )
+            # imopse parse_file returns (problem, extra), unwrap here
+            def _imopse_parse(fp: str) -> MultiskillRcpspProblem:
+                result = imopse_parse(fp)
+                return result[0] if isinstance(result, tuple) else result
+
+            for fp in imopse_avail():
+                instances.append(("imopse", fp, _imopse_parse))
+            logger.info(f"imopse: found {len(imopse_avail())} instances")
+        except FileNotFoundError as e:
+            logger.warning(f"imopse dataset not available: {e}")
+
+    if "mslib" in datasets:
+        try:
+            from discrete_optimization.rcpsp_multiskill.parser_mslib import (
+                get_data_available as mslib_avail,
+                parse_file as mslib_parse,
+            )
+            files_dict = mslib_avail()
+            count = 0
+            for tag, files in files_dict.items():
+                for fp in files:
+                    instances.append((f"mslib_{tag}", fp, mslib_parse))
+                    count += 1
+            logger.info(f"mslib: found {count} instances across {list(files_dict.keys())}")
+        except FileNotFoundError as e:
+            logger.warning(f"mslib dataset not available: {e}")
+
+    if "mspsp" in datasets:
+        try:
+            from discrete_optimization.rcpsp_multiskill.parser_mspsp import (
+                get_data_available as mspsp_avail,
+                parse_file as mspsp_parse,
+            )
+            files_dict = mspsp_avail()
+            count = 0
+            for sub_folder, subsets in files_dict.items():
+                for subset, files in subsets.items():
+                    for fp in files:
+                        instances.append((f"mspsp_{sub_folder}_{subset}", fp, mspsp_parse))
+                        count += 1
+            logger.info(f"mspsp: found {count} instances")
+        except FileNotFoundError as e:
+            logger.warning(f"mspsp dataset not available: {e}")
+
+    return instances
+
+
 def main():
     SOLVER_CHOICES = ["mm_hard", "mm_slack", "mm_soft", "cp", "cpsat", "lns", "optal"]
+    DATASET_CHOICES = ["imopse", "mslib", "mspsp"]
+
     parser = argparse.ArgumentParser(description="Benchmark MS-RCPSP relaxation and solvers.")
-    parser.add_argument("--solvers", nargs="+", 
-                        choices=SOLVER_CHOICES + ["all"],
-                        default=["all"],
-                        help="Solvers/strategies to run.")
+    parser.add_argument(
+        "--solvers",
+        nargs="+",
+        choices=SOLVER_CHOICES + ["all"],
+        default=["all"],
+        help="Solvers/strategies to run.",
+    )
+    parser.add_argument(
+        "--dataset",
+        nargs="+",
+        choices=DATASET_CHOICES + ["all"],
+        default=["imopse"],
+        help=(
+            "Dataset(s) to benchmark. "
+            "'imopse' uses parser_imopse, "
+            "'mslib' uses parser_mslib (MSLIB1-4), "
+            "'mspsp' uses parser_mspsp (.dzn files). "
+            "Use 'all' for all three."
+        ),
+    )
     parser.add_argument("--time_limit", type=int, default=60, help="Time limit per solver in seconds.")
     parser.add_argument("--analyze", action="store_true", help="Analyze instances before solving.")
     args = parser.parse_args()
 
     if "all" in args.solvers:
         args.solvers = SOLVER_CHOICES
+    if "all" in args.dataset:
+        args.dataset = DATASET_CHOICES
 
-    all_files = get_data_available()
-    # Decomment to select a few instances of different sizes for benchmarking
-    target_instances = [
-        f for f in all_files
-        # if "100_5_22_15.def" in f 
-        #    or "100_5_64_9.def" in f
-        #    or "200_10_84_9.def" in f
-        #    or "200_10_25_10.def" in f
-        #    or "500_20_24_11.def" in f
-    ]
-    
+    target_instances = _collect_instances(args.dataset)
+    # Uncomment filters below to select specific instances for quick runs, e.g.:
+    # target_instances = [(tag, fp, fn) for tag, fp, fn in target_instances if "100_5_22_15" in fp]
+
+    if not target_instances:
+        logger.warning("No instances found. Check that the requested datasets are available.")
+        return
+
     runner = BenchmarkRunner(time_limit_sec=args.time_limit)
-    
+
     # Dictionary to store results per solver
     solver_results = {s: [] for s in args.solvers}
-    
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(script_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
-    
-    for i, file_path in enumerate(target_instances):
+
+    for i, (dataset_tag, file_path, parse_fn) in enumerate(target_instances):
         instance_name = os.path.basename(file_path)
-        logger.info(f"PROCESS {i+1}/{len(target_instances)}: {instance_name} =============== ")
-        
+        logger.info(f"PROCESS {i+1}/{len(target_instances)}: [{dataset_tag}] {instance_name} =============== ")
+
         try:
-            problem, _ = parse_file(file_path)
-            
+            problem = parse_fn(file_path)
+
             # Phase 1: Analyze the instance (can be skipped without adding argument --analyze)
             if args.analyze:
                 metrics = InstanceAnalyzer.analyze(problem)
             else:
                 metrics = {}
+            metrics["dataset"] = dataset_tag
             metrics["instance"] = instance_name
-            
+
             # Phase 2: Solve with selected solvers/strategies
             if "mm_hard" in args.solvers:
                 res = runner.run_ms_to_mm(problem, strategy="hard")
@@ -341,11 +421,12 @@ def main():
                 res = runner.run_lns(problem)
                 solver_results["lns"].append({**metrics, **res})
                 pd.DataFrame(solver_results["lns"]).to_csv(os.path.join(output_dir, "benchmark_lns.csv"), index=False)
-            
+
         except Exception as e:
-            logger.error(f"Error processing {instance_name}: {e}")
+            logger.error(f"Error processing [{dataset_tag}] {instance_name}: {e}")
 
     logger.info("Benchmark complete. Results saved to separate CSV files.")
+
 
 if __name__ == "__main__":
     main()
