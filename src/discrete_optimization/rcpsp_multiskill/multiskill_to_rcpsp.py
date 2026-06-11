@@ -32,7 +32,7 @@ class MultiSkillToRcpsp:
         duration_task,
         horizon,
     ):
-        non_zeros_res = [r for r in task_requirements if task_requirements[r] >= 0]
+        non_zeros_res = [r for r in task_requirements if task_requirements[r] > 0]
         p = np.multiply.reduce(
             [
                 ressource_availability[non_zeros_res[j]][:horizon]
@@ -53,7 +53,7 @@ class MultiSkillToRcpsp:
         worker_type_name: list,
         resources_dict: dict,
         initial_mode_details: dict,
-    ) -> tuple[str, list[dict], list]:
+    ) -> tuple[str, list[dict], list, float]:
         """
         Enumerate and filter worker-type assignment modes for a single task.
 
@@ -61,7 +61,9 @@ class MultiSkillToRcpsp:
         - task (str): The task identifier
         - tt (list[dict]): List of filtered task requirement dicts (one per mode)
         - pruned_results (list): List of raw CP enumeration results that passed overskill filtering
+        - elapsed (float): Wall-clock time spent enumerating/filtering this task
         """
+        task_start = time.time()
         task_solver = PrecomputeEmployeesForTasks(
             ms_rcpsp_problem=self.multiskill_model, cp_solver_name=CpSolverName.CHUFFED
         )
@@ -96,16 +98,15 @@ class MultiSkillToRcpsp:
 
         # Build task_requirement_list from pruned results
         task_requirement_list = []
-        for i in range(len(pruned_results)):
-            ddd = initial_mode_details[task][pruned_results[i].mode_dict[task]]
+        for result in pruned_results:
+            ddd = initial_mode_details[task][result.mode_dict[task]]
             ddd = {
                 key: ddd[key]
                 for key in ddd
                 if key not in self.multiskill_model.skills_set
             }
             wtype_used = [
-                (j, pruned_results[i].worker_type_used[j][0])
-                for j in range(len(pruned_results[i].worker_type_used))
+                (j, used[0]) for j, used in enumerate(result.worker_type_used)
             ]
             index_non_zeros = [k for k in wtype_used if k[1] > 0]
 
@@ -132,7 +133,7 @@ class MultiSkillToRcpsp:
         else:
             tt = task_requirement_list
 
-        return task, tt, pruned_results
+        return task, tt, pruned_results, time.time() - task_start
 
     def construct_rcpsp_by_worker_type(
         self,
@@ -149,6 +150,10 @@ class MultiSkillToRcpsp:
         - Stage 2: Enumerate and select feasible worker-type assignments per task
         - Stage 3: Build the final RCPSP problem based on selected modes and worker-type availability
         """
+        if limit_number_of_mode_per_task and max_number_of_mode is None:
+            raise ValueError(
+                "max_number_of_mode must be set when limit_number_of_mode_per_task=True"
+            )
         start = time.time()
         logger.info("#1 : Cluster employees into worker types by skill profile")
         
@@ -212,7 +217,13 @@ class MultiSkillToRcpsp:
         stage1_time = time.time() - start
         
         # Stage 2: Mode enumeration and selection
-        effective_workers = nb_workers if nb_workers is not None else os.cpu_count()
+        # Each task spawns its own MiniZinc/CHUFFED subprocess (itself possibly
+        # multi-threaded), so default to half the cores to avoid oversubscription.
+        effective_workers = (
+            nb_workers
+            if nb_workers is not None
+            else max(1, (os.cpu_count() or 1) // 2)
+        )
         logger.info(f"{time.time() - start:.2f}s: Processing {len(self.multiskill_model.tasks_list)} tasks "
                     f"(parallel threads: {effective_workers})...")
         logger.info(f"{time.time() - start:.2f}s:   Limiting modes per task: {limit_number_of_mode_per_task}")
@@ -222,7 +233,6 @@ class MultiSkillToRcpsp:
 
         initial_mode_details = self.multiskill_model.mode_details
         mode_details_post_compute = {}
-        dictionnary_precompute = {}
         task_times = {}
 
         # ------------------------------------------------------------------
@@ -258,11 +268,10 @@ class MultiSkillToRcpsp:
                 dynamic_ncols=True,
             )
             for future in progress:
-                t_start = time.time()
                 task = future_to_task[future]
-                result_task, tt_filtered, pruned = future.result()
+                result_task, tt_filtered, pruned, elapsed = future.result()
                 enumeration_results[result_task] = (tt_filtered, pruned)
-                task_times[task] = time.time() - t_start
+                task_times[task] = elapsed
 
         # ------------------------------------------------------------------
         # Load-balancing and truncation
@@ -270,7 +279,6 @@ class MultiSkillToRcpsp:
         logger.info(f"{time.time() - start:.2f}s: Applying load-balancing heuristic and truncation to modes...")
         for task in tasks_list:
             tt, pruned_results = enumeration_results[task]
-            dictionnary_precompute[task] = pruned_results
             mode_details_post_compute[task] = {}
 
             # Sort by load-balancing heuristic
@@ -322,19 +330,18 @@ class MultiSkillToRcpsp:
                         if yy in usage_worker_in_chosen_modes:
                             usage_worker_in_chosen_modes[yy] += 1
         
-        if logger.isEnabledFor(logging.DEBUG):
-            # Log timing statistics
-            if task_times:
-                avg_task_time = np.mean(list(task_times.values()))
-                max_task = max(task_times, key=task_times.get)
-                max_task_time = task_times[max_task]
-                logger.debug(f"  Task timing: avg={avg_task_time:.3f}s, max={max_task_time:.3f}s (task {max_task})")
-            
-            # Log worker type usage statistics
-            logger.info("Worker type usage in selected modes:")
-            for wt in sorted(usage_worker_in_chosen_modes.keys()):
-                usage = usage_worker_in_chosen_modes[wt]
-                logger.info(f"  {wt}: {usage} usage(s)")
+        # Log timing statistics
+        if logger.isEnabledFor(logging.DEBUG) and task_times:
+            avg_task_time = np.mean(list(task_times.values()))
+            max_task = max(task_times, key=task_times.get)
+            max_task_time = task_times[max_task]
+            logger.debug(f"  Task timing: avg={avg_task_time:.3f}s, max={max_task_time:.3f}s (task {max_task})")
+
+        # Log worker type usage statistics
+        logger.info("Worker type usage in selected modes:")
+        for wt in sorted(usage_worker_in_chosen_modes.keys()):
+            usage = usage_worker_in_chosen_modes[wt]
+            logger.info(f"  {wt}: {usage} usage(s)")
 
         stage2_time = time.time() - start - stage1_time
         
